@@ -15,8 +15,10 @@ Outil pour traiter les fichiers MKV d'anime en conservant l'audio japonais et le
 3. Ouvrez PowerShell et exécutez : `pip install -r requirements.txt`
 4. Lancez le script : `python anime_mkvtool_vostfr.py`
 
-## Utilisation
+## Utilisation et Fonctionnalités
 
-1. Sélectionnez le dossier contenant vos fichiers MKV
-2. Choisissez les pistes à conserver
-3. Le traitement se fera automatiquement
+- Traitement par lot : traite tous les fichiers MKV d'un dossier en une fois
+- Crée un sous-dossier "processed" pour les fichiers traités
+- Conserve les fichiers originaux
+- Permet la sélection des sous-titres à conserver
+- Traitement multiprocessus pour de meilleures performances
