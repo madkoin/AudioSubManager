@@ -8,17 +8,13 @@ Outil pour traiter les fichiers MKV d'anime en conservant l'audio japonais et le
 - MKVToolNix (mkvmerge)
 - Les dépendances Python seront installées automatiquement
 
-## Installation
+## Utilisation
 
-1. Clonez le repository
-2. Installez MKVToolNix
-3. Ouvrez PowerShell et exécutez : `pip install -r requirements.txt`
+1. Ouvrez PowerShell
+2. Naviguez vers le dossier du script
+3. Installez les dépendances : `pip install -r requirements.txt`
 4. Lancez le script : `python anime_mkvtool_vostfr.py`
+5. Sélectionnez le dossier contenant vos fichiers MKV
+6. Choisissez les pistes à conserver
 
-## Utilisation et Fonctionnalités
-
-- Traitement par lot : traite tous les fichiers MKV d'un dossier en une fois
-- Crée un sous-dossier "processed" pour les fichiers traités
-- Conserve les fichiers originaux
-- Permet la sélection des sous-titres à conserver
-- Traitement multiprocessus pour de meilleures performances
+Note : Les fichiers traités seront placés dans un sous-dossier "processed", les originaux sont conservés.
