@@ -12,7 +12,8 @@ Outil pour traiter les fichiers MKV d'anime en conservant l'audio japonais et le
 
 1. Clonez le repository
 2. Installez MKVToolNix
-3. Lancez le script : `python anime_mkvtool_vostfr.py`
+3. Ouvrez PowerShell et exécutez : `pip install -r requirements.txt`
+4. Lancez le script : `python anime_mkvtool_vostfr.py`
 
 ## Utilisation
 
