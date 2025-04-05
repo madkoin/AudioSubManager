@@ -25,7 +25,7 @@ Outil polyvalent pour le traitement de fichiers MKV permettant de :
 1. Ouvrez PowerShell
 2. Naviguez vers le dossier du script
 3. Installez les dépendances : `pip install -r requirements.txt`
-4. Lancez le script : `python anime_mkvtool_vostfr.py`
+4. Lancez le script : `AudioSubManager.py`
 5. Sélectionnez le dossier contenant vos fichiers MKV
 6. Choisissez les pistes audio à conserver (plusieurs sélections possibles)
 7. Décidez si vous souhaitez conserver des sous-titres
