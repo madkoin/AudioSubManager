@@ -3,13 +3,15 @@ MKV Processor - Outil de traitement de fichiers MKV
 =================================================
 
 Ce script permet de traiter des fichiers MKV en:
-- Conservant uniquement la piste audio japonaise
-- Gardant les sous-titres français sélectionnés
-- Supprimant les pistes audio françaises
+- Conservant uniquement les pistes audio et sous-titres sélectionnés par l'utilisateur
+- Supprimant les pistes non désirées
+- Fonctionne sur toutes les langues
+- Utilise les ressources de la machine de façon sûre et adaptée
 
 Dépendances: mkvmerge (MKVToolNix), Python 3.6+
 """
 
+# Import des modules standards et externes (à ne faire qu'ici, pas dans les fonctions)
 import os
 import subprocess
 import json
@@ -24,18 +26,84 @@ import platform
 from typing import List, Dict, Tuple, Optional
 import logging
 
-# Configuration globale
+# Configuration globale du script
 CONFIG = {
-    'MIN_PROCESSES': 4,
-    'MEMORY_PER_PROCESS': 500 * 1024 * 1024,  # 500 Mo par processus
-    'SUPPORTED_LANGUAGES': {
+    'MIN_PROCESSES': 2,  # Nombre minimal de processus pour le traitement parallèle
+    'MAX_PROCESSES': 8,  # Nombre maximal de processus (pour éviter de saturer la machine)
+    'MEMORY_BUFFER_PERCENTAGE': 0.2,  # Pourcentage de RAM à laisser libre (sécurité)
+    'DEFAULT_LANGUAGES': {
         'audio_source': ['jpn', 'ja'],
         'subtitle_target': ['fre', 'fr']
     }
 }
 
-# Configuration du logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configuration du logging (journalisation des événements)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('mkv_processor.log'),
+        logging.StreamHandler(),
+        logging.FileHandler('track_names_debug.log')  # Pour debug des noms de pistes
+    ]
+)
+
+# Classe d'exception personnalisée pour les erreurs de traitement
+class ProcessingError(Exception):
+    """Exception personnalisée pour les erreurs de traitement"""
+    pass
+
+# Classe pour gérer l'état du traitement (fichiers déjà traités, échecs, etc.)
+class ProcessingState:
+    """Classe pour gérer l'état du traitement et permettre la reprise"""
+    def __init__(self, state_file: str = "processing_state.json"):
+        self.state_file = state_file
+        self.processed_files = set()
+        self.failed_files = {}
+        self.load_state()
+
+    def load_state(self):
+        """Charge l'état précédent du traitement depuis un fichier JSON"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    self.processed_files = set(state.get('processed_files', []))
+                    self.failed_files = state.get('failed_files', {})
+        except Exception as e:
+            logging.warning(f"Impossible de charger l'état précédent : {e}")
+
+    def save_state(self):
+        """Sauvegarde l'état actuel du traitement dans un fichier JSON"""
+        try:
+            state = {
+                'processed_files': list(self.processed_files),
+                'failed_files': self.failed_files
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            logging.error(f"Erreur lors de la sauvegarde de l'état : {e}")
+
+    def mark_as_processed(self, filename: str):
+        """Marque un fichier comme traité avec succès"""
+        self.processed_files.add(filename)
+        if filename in self.failed_files:
+            del self.failed_files[filename]
+        self.save_state()
+
+    def mark_as_failed(self, filename: str, error: str):
+        """Marque un fichier comme échoué avec la raison"""
+        self.failed_files[filename] = error
+        self.save_state()
+
+    def is_processed(self, filename: str) -> bool:
+        """Vérifie si un fichier a déjà été traité"""
+        return filename in self.processed_files
+
+    def get_failed_files(self) -> Dict[str, str]:
+        """Retourne la liste des fichiers échoués"""
+        return self.failed_files
 
 def check_and_install_dependencies():
     """
@@ -151,44 +219,216 @@ def get_mkv_tracks(input_path, mkvmerge_path):
         logging.error(f"Erreur lors de l'analyse du fichier : {e}")
         return None
 
-def choose_subtitle(french_subtitles: List[Dict], first_file: Optional[str] = None) -> Tuple[Optional[Dict], bool]:
+def get_track_language(track: Dict) -> str:
+    """
+    Récupère la langue d'une piste de manière standardisée.
+    
+    Args:
+        track: Informations de la piste
+        
+    Returns:
+        str: Code de langue standardisé ou 'N/A'
+    """
+    language = track.get('properties', {}).get('language', 'N/A')
+    # Conversion des codes de langue courants
+    language_map = {
+        'jpn': 'Japonais',
+        'ja': 'Japonais',
+        'fre': 'Français',
+        'fr': 'Français',
+        'eng': 'Anglais',
+        'en': 'Anglais',
+        'ger': 'Allemand',
+        'de': 'Allemand',
+        'spa': 'Espagnol',
+        'es': 'Espagnol',
+        'ita': 'Italien',
+        'it': 'Italien',
+        'por': 'Portugais',
+        'pt': 'Portugais',
+        'rus': 'Russe',
+        'ru': 'Russe',
+        'chi': 'Chinois',
+        'zh': 'Chinois',
+        'kor': 'Coréen',
+        'ko': 'Coréen'
+    }
+    return language_map.get(language.lower(), language.upper())
+
+def safe_track_name(track):
+    """
+    Corrige l'affichage des noms de pistes audio/sous-titres pour gérer les encodages exotiques.
+    Log aussi le nom brut pour debug.
+    """
+    name = track.get('properties', {}).get('track_name', '')
+    if not name:
+        return 'Nom non lisible'
+    try:
+        # Log du nom brut pour debug
+        logging.info(f"Nom brut: {repr(name)}")
+        if isinstance(name, bytes):
+            return name.decode('utf-8')
+        try:
+            return name.encode('latin1').decode('utf-8')
+        except Exception:
+            return name
+    except Exception:
+        return 'Nom non lisible'
+
+def choose_audio_tracks(audio_tracks: List[Dict], first_file: Optional[str] = None) -> Tuple[List[Dict], bool, bool]:
+    """
+    Interface interactive pour choisir les pistes audio avec des cases à cocher.
+
+    Args:
+        audio_tracks: Liste des pistes audio disponibles
+        first_file: Nom du premier fichier (optionnel)
+
+    Returns:
+        Tuple[List[Dict], bool, bool]: (Liste des pistes audio sélectionnées, Annulation, Retour)
+    """
+    if not audio_tracks:
+        raise ValueError("La liste des pistes audio ne peut pas être vide")
+
+    root = Toplevel()
+    root.title("Sélection des pistes audio")
+    root.geometry("600x400")
+    root.deiconify()
+    root.lift()
+    root.focus_force()
+
+    if first_file:
+        Label(root, text=f"Choisissez les pistes audio pour {first_file} :", font=UNICODE_FONT).pack()
+    else:
+        Label(root, text="Choisissez les pistes audio à conserver :", font=UNICODE_FONT).pack()
+
+    main_frame = tk.Frame(root)
+    main_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    audio_vars = []
+    audio_checkboxes = []
+    audio_tracks.sort(key=lambda x: get_track_language(x))
+
+    for audio in audio_tracks:
+        var = tk.BooleanVar(value=False)
+        audio_vars.append((var, audio))
+        language = get_track_language(audio)
+        display_text = (
+            f"Piste {audio['id']} - "
+            f"Langue: {language} | "
+            f"Codec : {audio.get('codec', 'N/A')}"
+        )
+        cb = tk.Checkbutton(scrollable_frame, text=display_text, variable=var, font=UNICODE_FONT)
+        cb.pack(anchor='w', pady=2)
+        audio_checkboxes.append(cb)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    selected_audio = [None]
+    canceled = [False]
+    back = [False]
+
+    def on_confirm():
+        selected = [audio for (var, audio) in audio_vars if var.get()]
+        if not selected:
+            messagebox.showwarning("Attention", "Veuillez sélectionner au moins une piste audio.")
+            return
+        selected_audio[0] = selected
+        root.destroy()
+
+    def on_cancel():
+        canceled[0] = True
+        root.destroy()
+
+    def on_back():
+        back[0] = True
+        root.destroy()
+
+    button_frame = tk.Frame(root)
+    button_frame.pack(pady=10)
+
+    Button(button_frame, text="Confirmer", command=on_confirm, font=UNICODE_FONT).pack(side='left', padx=5)
+    Button(button_frame, text="Annuler", command=on_cancel, font=UNICODE_FONT).pack(side='right', padx=5)
+    Button(button_frame, text="Retour", command=on_back, font=UNICODE_FONT).pack(side='left', padx=5)
+
+    root.wait_window()
+
+    return selected_audio[0], canceled[0], back[0]
+
+def choose_subtitle(french_subtitles: List[Dict], first_file: Optional[str] = None) -> Tuple[Optional[Dict], bool, bool]:
     """
     Interface interactive pour choisir les sous-titres.
 
     Args:
-        french_subtitles: Liste des sous-titres français disponibles
+        french_subtitles: Liste des sous-titres disponibles
         first_file: Nom du premier fichier (optionnel)
 
     Returns:
-        Tuple[Dict, bool]: (Sous-titre sélectionné, Annulation)
-
-    Raises:
-        ValueError: Si la liste des sous-titres est vide
+        Tuple[Dict, bool, bool]: (Sous-titre sélectionné, Annulation, Retour)
     """
     if not french_subtitles:
         raise ValueError("La liste des sous-titres ne peut pas être vide")
 
     root = Toplevel()
     root.title("Sélection des sous-titres")
+    root.geometry("600x400")
+    root.deiconify()
+    root.lift()
+    root.focus_force()
 
     if first_file:
-        Label(root, text=f"Choisissez la piste de sous-titres pour {first_file} :").pack()
+        Label(root, text=f"Choisissez la piste de sous-titres pour {first_file} :", font=UNICODE_FONT).pack()
     else:
-        Label(root, text="Choisissez la piste de sous-titres à utiliser :").pack()
+        Label(root, text="Choisissez la piste de sous-titres à utiliser :", font=UNICODE_FONT).pack()
 
-    listbox = Listbox(root, selectmode=SINGLE)
-    listbox.pack(padx=10, pady=10, fill='both', expand=True)
+    # Frame pour la liste avec scrollbar
+    main_frame = tk.Frame(root)
+    main_frame.pack(fill='both', expand=True, padx=10, pady=5)
 
-    for idx, subtitle in enumerate(french_subtitles, 1):
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    # Trier les sous-titres par langue
+    french_subtitles.sort(key=lambda x: get_track_language(x))
+
+    # Remplace la Listbox par une version plus large et avec padding
+    listbox = Listbox(scrollable_frame, selectmode=SINGLE, font=UNICODE_FONT, width=60, height=15)
+    listbox.pack(fill='both', expand=True, padx=20, pady=10)
+    for subtitle in french_subtitles:
+        language = get_track_language(subtitle)
         display_text = (
             f"Piste {subtitle['id']} - "
-            f"Langue: {subtitle.get('properties', {}).get('language', 'N/A')} | "
-            f"Nom : {subtitle.get('properties', {}).get('track_name', 'N/A')}"
+            f"Langue: {language}"
         )
         listbox.insert(END, display_text)
 
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
     selected_subtitle = [None]
     canceled = [False]
+    back = [False]
 
     def on_select():
         if listbox.curselection():
@@ -200,19 +440,24 @@ def choose_subtitle(french_subtitles: List[Dict], first_file: Optional[str] = No
         canceled[0] = True
         root.destroy()
 
-    Button(root, text="Sélectionner", command=on_select).pack(side='left', padx=5, pady=5)
-    Button(root, text="Annuler", command=on_cancel).pack(side='right', padx=5, pady=5)
+    def on_back():
+        back[0] = True
+        root.destroy()
+
+    Button(root, text="Sélectionner", command=on_select, font=UNICODE_FONT).pack(side='left', padx=5, pady=5)
+    Button(root, text="Annuler", command=on_cancel, font=UNICODE_FONT).pack(side='right', padx=5, pady=5)
+    Button(root, text="Retour", command=on_back, font=UNICODE_FONT).pack(side='left', padx=5, pady=5)
 
     root.wait_window()
 
-    return selected_subtitle[0], canceled[0]
+    return selected_subtitle[0], canceled[0], back[0]
 
-def choose_subtitles(french_subtitles: List[Dict], first_file: str, selected_main_subtitle: Dict) -> List[Dict]:
+def choose_subtitles(french_subtitles: List[Dict], first_file: str, selected_main_subtitle: Dict) -> Tuple[List[Dict], bool, bool]:
     """
     Interface interactive pour choisir plusieurs pistes de sous-titres.
 
     Args:
-        french_subtitles: Liste des sous-titres français disponibles
+        french_subtitles: Liste des sous-titres disponibles
         first_file: Nom du premier fichier
         selected_main_subtitle: Sous-titre principal déjà sélectionné
 
@@ -224,40 +469,78 @@ def choose_subtitles(french_subtitles: List[Dict], first_file: str, selected_mai
 
     root = Toplevel()
     root.title(f"Sélection des sous-titres pour {first_file}")
+    root.geometry("600x400")
+    root.deiconify()
+    root.lift()
+    root.focus_force()
 
-    Label(root, text="Sélectionnez les pistes de sous-titres à conserver :").pack()
+    Label(root, text="Sélectionnez les pistes de sous-titres à conserver :", font=UNICODE_FONT).pack()
+
+    # Frame pour les cases à cocher avec scrollbar
+    main_frame = tk.Frame(root)
+    main_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+    canvas = tk.Canvas(main_frame)
+    scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = tk.Frame(canvas)
+
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
 
     subtitle_vars = []
     subtitle_checkboxes = []
 
-    for subtitle in french_subtitles:
-        var = tk.BooleanVar(
-            value=subtitle.get('properties', {}).get('track_name') == selected_main_subtitle.get('properties', {}).get('track_name')
-        )
-        subtitle_vars.append((var, subtitle))
+    # Trier les sous-titres par langue
+    french_subtitles.sort(key=lambda x: get_track_language(x))
 
+    for subtitle in french_subtitles:
+        if selected_main_subtitle is not None:
+            value = subtitle.get('properties', {}).get('track_name') == selected_main_subtitle.get('properties', {}).get('track_name')
+        else:
+            value = False
+        var = tk.BooleanVar(value=value)
+        subtitle_vars.append((var, subtitle))
+        language = get_track_language(subtitle)
         display_text = (
             f"Piste {subtitle['id']} - "
-            f"Langue: {subtitle.get('properties', {}).get('language', 'N/A')} | "
-            f"Nom : {subtitle.get('properties', {}).get('track_name', 'N/A')}"
+            f"Langue: {language}"
         )
-
-        cb = tk.Checkbutton(root, text=display_text, variable=var)
-        cb.pack(anchor='w')
+        cb = tk.Checkbutton(scrollable_frame, text=display_text, variable=var, font=UNICODE_FONT)
+        cb.pack(anchor='w', pady=2)
         subtitle_checkboxes.append(cb)
 
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
     selected_subtitles = [None]
+    canceled = [False]
+    back = [False]
 
     def on_confirm():
         selected = [subtitle for (var, subtitle) in subtitle_vars if var.get()]
         selected_subtitles[0] = selected
         root.destroy()
 
-    Button(root, text="Confirmer la sélection", command=on_confirm).pack(pady=10)
+    def on_cancel():
+        canceled[0] = True
+        root.destroy()
+
+    def on_back():
+        back[0] = True
+        root.destroy()
+
+    Button(root, text="Confirmer la sélection", command=on_confirm, font=UNICODE_FONT).pack(pady=10, side='left')
+    Button(root, text="Annuler", command=on_cancel, font=UNICODE_FONT).pack(pady=10, side='left')
+    Button(root, text="Retour", command=on_back, font=UNICODE_FONT).pack(pady=10, side='left')
 
     root.wait_window()
 
-    return selected_subtitles[0] or []
+    return (selected_subtitles[0] or [], canceled[0], back[0])
 
 def calculate_directory_size(directory):
     """
@@ -309,31 +592,81 @@ def detect_gpu():
         logging.error(f"Erreur lors de la détection du GPU : {e}")
         return None
 
-def calculate_optimal_processes():
+def get_system_resources() -> Dict[str, float]:
     """
-    Calcule le nombre optimal de processus en fonction des ressources système.
+    Récupère les informations sur les ressources système disponibles.
+    
+    Returns:
+        Dict[str, float]: Dictionnaire contenant les informations sur la mémoire et le CPU
     """
-    # Nombre total de cœurs
-    total_cores = multiprocessing.cpu_count()
+    memory = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=1)
+    
+    return {
+        'total_memory': memory.total,
+        'available_memory': memory.available,
+        'memory_percent': memory.percent,
+        'cpu_percent': cpu_percent
+    }
 
-    # Mémoire totale et disponible
-    total_memory = psutil.virtual_memory().total
-    available_memory = psutil.virtual_memory().available
-
-    # Estimation de la mémoire par processus (approximation)
-    estimated_memory_per_process = CONFIG['MEMORY_PER_PROCESS']
-
-    # Calcul du nombre de processus basé sur la mémoire
-    memory_based_processes = max(1, int(available_memory / estimated_memory_per_process))
-
-    # Calcul du nombre optimal de processus
-    optimal_processes = min(
-        total_cores, # Ne pas dépasser le nombre de cœurs
-        memory_based_processes, # Limiter par la mémoire disponible
-        max(total_cores // 2, CONFIG['MIN_PROCESSES']) # Au moins 4 processus, ou la moitié des cœurs
+def show_system_config():
+    """
+    Affiche une fenêtre résumant la configuration système (CPU, RAM, GPU) à l'utilisateur.
+    Cette fenêtre est purement informative et permet de vérifier que le script s'adapte à la machine.
+    """
+    cpu_count = multiprocessing.cpu_count()
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    try:
+        gpu = detect_gpu() or 'Aucun GPU détecté'
+    except Exception:
+        gpu = 'Non détecté'
+    # Création de la fenêtre Tkinter
+    root = tk.Toplevel()
+    root.title("Configuration système")
+    root.geometry("500x260")
+    root.resizable(False, False)
+    Label = tk.Label
+    # Explication utilisateur
+    Label(root, text="Résumé de la configuration de votre PC :", font=UNICODE_FONT).pack(pady=(10,0))
+    Label(root, text="Cette fenêtre s'affiche pour vous informer des ressources qui seront utilisées pour le traitement automatique.\nAucune action n'est requise de votre part.", font=UNICODE_FONT, wraplength=480, justify='left').pack(pady=(0,10))
+    # Résumé technique
+    Label(root, text=f"- CPU : {cpu_count} cœurs", font=UNICODE_FONT).pack()
+    Label(root, text=f"- RAM : {ram_gb:.1f} Go", font=UNICODE_FONT).pack()
+    Label(root, text=f"- GPU : {gpu}", font=UNICODE_FONT).pack()
+    # Bouton pour fermer la fenêtre
+    def close_popup():
+        root.destroy()
+    btn = tk.Button(root, text="OK", command=close_popup, font=UNICODE_FONT, width=12)
+    btn.pack(pady=15)
+    root.deiconify(); root.lift(); root.focus_force()
+    root.wait_window()
+    # Log de la configuration pour le suivi
+    resume = (
+        f"Configuration détectée :\n"
+        f"- CPU : {cpu_count} cœurs\n"
+        f"- RAM : {ram_gb:.1f} Go\n"
+        f"- GPU : {gpu}"
     )
+    logging.info(resume)
 
-    return optimal_processes
+def calculate_optimal_processes() -> int:
+    """
+    Calcule le nombre optimal de processus en fonction des ressources système (mode sûr mais adapté à la config).
+    """
+    resources = get_system_resources()
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = resources['available_memory']
+    memory_per_process = 500 * 1024 * 1024  # 500 Mo par processus
+    # Mode sûr mais dynamique :
+    # - Ne dépasse pas la moitié des cœurs CPU si >4, sinon tous les cœurs
+    # - Ne dépasse pas la RAM disponible avec tampon
+    # - Prend en compte la charge CPU actuelle
+    max_cpu = cpu_count // 2 if cpu_count > 4 else cpu_count
+    memory_based_processes = int(available_memory * (1 - CONFIG['MEMORY_BUFFER_PERCENTAGE']) / memory_per_process)
+    cpu_load = resources['cpu_percent']
+    cpu_based_processes = int(max_cpu * (1 - cpu_load/100))
+    optimal_processes = min(memory_based_processes, cpu_based_processes, max_cpu)
+    return max(CONFIG['MIN_PROCESSES'], min(optimal_processes, CONFIG['MAX_PROCESSES']))
 
 def find_tracks(track_info):
     """
@@ -419,276 +752,149 @@ def find_matching_subtitle(french_subtitles, selected_subtitle):
     # 4. Fallback : premier sous-titre français
     return french_subtitles[0] if french_subtitles else None
 
-def choose_audio_tracks(audio_tracks: List[Dict], first_file: Optional[str] = None) -> Tuple[List[Dict], bool]:
+def process_single_mkv(mkvmerge_path: str, input_dir: str, output_dir: str, filename: str,
+                      selected_audio_tracks: List[Dict], selected_main_subtitle: Dict,
+                      selected_subtitles: List[Dict], state: ProcessingState) -> bool:
     """
-    Interface interactive pour choisir les pistes audio avec des cases à cocher.
-
-    Args:
-        audio_tracks: Liste des pistes audio disponibles
-        first_file: Nom du premier fichier (optionnel)
-
-    Returns:
-        Tuple[List[Dict], bool]: (Liste des pistes audio sélectionnées, Annulation)
-    """
-    if not audio_tracks:
-        raise ValueError("La liste des pistes audio ne peut pas être vide")
-
-    root = Toplevel()
-    root.title("Sélection des pistes audio")
-
-    if first_file:
-        Label(root, text=f"Choisissez les pistes audio pour {first_file} :").pack()
-    else:
-        Label(root, text="Choisissez les pistes audio à conserver :").pack()
-
-    # Frame pour les cases à cocher
-    checkbox_frame = tk.Frame(root)
-    checkbox_frame.pack(padx=10, pady=10, fill='both', expand=True)
-
-    # Variables pour les cases à cocher
-    audio_vars = []
-    audio_checkboxes = []
-
-    for audio in audio_tracks:
-        var = tk.BooleanVar(value=True)  # Par défaut, toutes les pistes sont sélectionnées
-        audio_vars.append((var, audio))
-
-        display_text = (
-            f"Piste {audio['id']} - "
-            f"Langue: {audio.get('properties', {}).get('language', 'N/A')} | "
-            f"Nom : {audio.get('properties', {}).get('track_name', 'N/A')} | "
-            f"Codec : {audio.get('codec', 'N/A')}"
-        )
-
-        cb = tk.Checkbutton(checkbox_frame, text=display_text, variable=var)
-        cb.pack(anchor='w')
-        audio_checkboxes.append(cb)
-
-    selected_audio = [None]
-    canceled = [False]
-
-    def on_confirm():
-        selected = [audio for (var, audio) in audio_vars if var.get()]
-        if not selected:
-            messagebox.showwarning("Attention", "Veuillez sélectionner au moins une piste audio.")
-            return
-        selected_audio[0] = selected
-        root.destroy()
-
-    def on_cancel():
-        canceled[0] = True
-        root.destroy()
-
-    # Frame pour les boutons
-    button_frame = tk.Frame(root)
-    button_frame.pack(pady=10)
-
-    Button(button_frame, text="Confirmer", command=on_confirm).pack(side='left', padx=5)
-    Button(button_frame, text="Annuler", command=on_cancel).pack(side='right', padx=5)
-
-    root.wait_window()
-
-    return selected_audio[0], canceled[0]
-
-def process_single_mkv(mkvmerge_path, input_dir, output_dir, filename, selected_audio_tracks, selected_main_subtitle, selected_subtitles):
-    """
-    Traite un seul fichier MKV.
-    """
-    input_path = os.path.join(input_dir, filename)
-    output_filename = f"{os.path.splitext(filename)[0]}_processed.mkv"
-    output_path = os.path.join(output_dir, output_filename)
-
-    # Obtenir les informations des pistes
-    track_info = get_mkv_tracks(input_path, mkvmerge_path)
-    if not track_info:
-        logging.error(f"Impossible de traiter {filename}")
-        return False
-
-    # Trouver les pistes correspondantes
-    matching_audio_tracks = []
-    for selected_audio in selected_audio_tracks:
-        matching_audio = find_matching_subtitle(
-            [track for track in track_info.get('tracks', []) if track['type'] == 'audio'],
-            selected_audio
-        )
-        if matching_audio:
-            matching_audio_tracks.append(matching_audio)
+    Traite un seul fichier MKV avec gestion des erreurs et reprise.
     
-    if not matching_audio_tracks:
-        logging.error(f"Aucune piste audio correspondante trouvée dans {filename}")
-        return False
-
-    # Construire la commande MKVMerge
-    cmd = [
-        mkvmerge_path,
-        '-o', output_path,
-        # Ne garder que les pistes audio sélectionnées
-        '--audio-tracks', ','.join(map(str, [audio['id'] for audio in matching_audio_tracks])),
-        # Définir la première piste audio comme piste audio par défaut
-        '--default-track', f"{matching_audio_tracks[0]['id']}:yes"
-    ]
-
-    # Gestion des sous-titres
-    if selected_main_subtitle:
-        french_subtitles = [track for track in track_info.get('tracks', []) 
-                          if track['type'] == 'subtitles' and 
-                          track.get('properties', {}).get('language') in CONFIG['SUPPORTED_LANGUAGES']['subtitle_target']]
+    Args:
+        mkvmerge_path: Chemin vers mkvmerge
+        input_dir: Répertoire d'entrée
+        output_dir: Répertoire de sortie
+        filename: Nom du fichier à traiter
+        selected_audio_tracks: Liste des pistes audio sélectionnées
+        selected_main_subtitle: Sous-titre principal sélectionné
+        selected_subtitles: Liste des sous-titres sélectionnés
+        state: État du traitement pour la reprise
         
-        matching_main_subtitle = find_matching_subtitle(french_subtitles, selected_main_subtitle)
-        if matching_main_subtitle:
-            subtitle_tracks_to_keep = [matching_main_subtitle['id']]
-            # Ajouter les autres sous-titres sélectionnés
-            for selected_subtitle in selected_subtitles:
-                matching_subtitle = find_matching_subtitle(french_subtitles, selected_subtitle)
-                if matching_subtitle and matching_subtitle['id'] != matching_main_subtitle['id']:
-                    subtitle_tracks_to_keep.append(matching_subtitle['id'])
-            
-            if subtitle_tracks_to_keep:  # Vérifier qu'il y a des sous-titres à conserver
-                cmd.extend([
-                    '--subtitle-tracks', ','.join(map(str, subtitle_tracks_to_keep)),
-                    '--default-track', f"{matching_main_subtitle['id']}:yes"
-                ])
-    else:
-        # Si aucun sous-titre n'est sélectionné, supprimer tous les sous-titres
-        cmd.append('--no-subtitles')
+    Returns:
+        bool: True si le traitement a réussi, False sinon
+    """
+    if state.is_processed(filename):
+        logging.info(f"Fichier {filename} déjà traité, passage au suivant")
+        return True
 
-    cmd.append(input_path)
+    input_path = os.path.join(input_dir, filename)
+    output_path = os.path.join(output_dir, f"processed_{filename}")
 
     try:
-        # Exécuter la commande
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logging.info(f"Traité : {filename}")
-        
-        # Informations sur les pistes conservées
-        logging.info(f"Pistes audio conservées dans {filename}:")
-        for audio in matching_audio_tracks:
-            logging.info(f"  - Piste {audio['id']}: {audio.get('properties', {}).get('track_name', 'N/A')}")
-        
-        if selected_main_subtitle and subtitle_tracks_to_keep:  # N'afficher les infos des sous-titres que s'il y en a
-            logging.info(f"Pistes de sous-titres dans {filename}:")
-            for subtitle_id in subtitle_tracks_to_keep:
-                subtitle = next((s for s in french_subtitles if s['id'] == subtitle_id), None)
-                if subtitle:
-                    logging.info(f"  - Piste {subtitle['id']}: {subtitle.get('properties', {}).get('track_name', 'N/A')}")
+        # Vérification de l'espace disque disponible
+        free_space = psutil.disk_usage(output_dir).free
+        file_size = os.path.getsize(input_path)
+        if free_space < file_size * 1.5:  # 50% de marge
+            raise ProcessingError(f"Espace disque insuffisant pour traiter {filename}")
 
+        # Construction de la commande mkvmerge
+        command = [mkvmerge_path, '-o', output_path]
+        
+        # Ajout des pistes audio sélectionnées
+        for track in selected_audio_tracks:
+            command.extend(['--audio-tracks', str(track['id'])])
+        
+        # Ajout des sous-titres sélectionnés
+        for subtitle in selected_subtitles:
+            command.extend(['--subtitle-tracks', str(subtitle['id'])])
+        
+        command.append(input_path)
+
+        # Exécution de la commande
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        
+        # Vérification du fichier de sortie
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise ProcessingError(f"Le fichier de sortie {output_path} est vide ou n'existe pas")
+
+        state.mark_as_processed(filename)
+        logging.info(f"Traitement réussi pour {filename}")
         return True
+
     except subprocess.CalledProcessError as e:
-        logging.error(f"Erreur lors du traitement de {filename}: {e}")
-        logging.error(f"Sortie standard: {e.stdout}")
-        logging.error(f"Erreur standard: {e.stderr}")
+        error_msg = f"Erreur lors du traitement de {filename}: {e.stderr}"
+        logging.error(error_msg)
+        state.mark_as_failed(filename, error_msg)
+        return False
+    except ProcessingError as e:
+        logging.error(str(e))
+        state.mark_as_failed(filename, str(e))
+        return False
+    except Exception as e:
+        error_msg = f"Erreur inattendue lors du traitement de {filename}: {str(e)}"
+        logging.error(error_msg)
+        state.mark_as_failed(filename, error_msg)
         return False
 
-def process_mkv_files(input_dir, output_dir, mkvmerge_path):
-    """
-    Traite les fichiers MKV en parallèle.
-    """
-    # Créer le répertoire de sortie
-    os.makedirs(output_dir, exist_ok=True)
-    # Calculer la taille initiale
-    initial_size = calculate_directory_size(input_dir)
-    # Filtrer les fichiers MKV
-    mkv_files = [f for f in os.listdir(input_dir) if f.endswith('.mkv')]
-    
-    if not mkv_files:
-        messagebox.showerror("Erreur", "Aucun fichier MKV trouvé dans le dossier sélectionné.")
-        return
-        
-    # Prendre le premier fichier pour la sélection des pistes
-    first_file = mkv_files[0]
-    first_file_path = os.path.join(input_dir, first_file)
-    
-    # Obtenir les informations des pistes du premier fichier
-    track_info = get_mkv_tracks(first_file_path, mkvmerge_path)
-    if not track_info:
-        messagebox.showerror("Erreur", "Impossible de lire les pistes du premier fichier.")
-        return
-        
-    # Trouver toutes les pistes audio et sous-titres
-    all_audio_tracks = [track for track in track_info.get('tracks', []) if track['type'] == 'audio']
-    french_subtitles = [track for track in track_info.get('tracks', []) 
-                       if track['type'] == 'subtitles' and 
-                       track.get('properties', {}).get('language') in CONFIG['SUPPORTED_LANGUAGES']['subtitle_target']]
-    
-    # Sélection des pistes audio
-    selected_audio_tracks, audio_canceled = choose_audio_tracks(all_audio_tracks, first_file)
-    if audio_canceled:
-        messagebox.showinfo("Information", "Opération annulée.")
-        return
-    if not selected_audio_tracks:
-        messagebox.showerror("Erreur", "Aucune piste audio sélectionnée.")
-        return
-        
-    # Sélection des sous-titres (optionnelle)
-    selected_main_subtitle = None
-    selected_subtitles = []
-    
-    if french_subtitles:
-        want_subtitles = messagebox.askyesno("Sous-titres", 
-                                           "Voulez-vous conserver des sous-titres ?")
-        if want_subtitles:
-            selected_main_subtitle, subtitle_canceled = choose_subtitle(french_subtitles, first_file)
-            if subtitle_canceled:
-                messagebox.showinfo("Information", "Opération annulée.")
-                return
-            if selected_main_subtitle:
-                selected_subtitles = choose_subtitles(french_subtitles, first_file, selected_main_subtitle)
-    else:
-        messagebox.showinfo("Information", "Aucune piste de sous-titres française trouvée.")
-    
-    # Détecter le GPU
-    gpu_type = detect_gpu()
-    logging.info(f"GPU détecté : {gpu_type if gpu_type else 'Aucun GPU spécifique'}")
-    
-    # Calculer le nombre optimal de processus
-    num_processes = calculate_optimal_processes()
-    logging.info(f"Nombre de processus : {num_processes}")
-    
-    # Mesurer le temps de début
-    start_time = time.time()
-    
-    # Utiliser un pool de processus
-    with multiprocessing.Pool(processes=num_processes) as pool:
-        # Fonction partielle avec les arguments fixes
-        process_func = partial(
-            process_single_mkv,
-            mkvmerge_path,
-            input_dir,
-            output_dir,
-            selected_audio_tracks=selected_audio_tracks,
-            selected_main_subtitle=selected_main_subtitle,
-            selected_subtitles=selected_subtitles
+def process_mkv_files(input_dir: str, output_dir: str, mkvmerge_path: str):
+    # Reset automatique de l'état à chaque lancement
+    state_file = 'processing_state.json'
+    if os.path.exists(state_file):
+        os.remove(state_file)
+        logging.info('Fichier d\'état supprimé, tous les fichiers seront retraités.')
+    state = ProcessingState()
+    failed_files = state.get_failed_files()
+    if failed_files:
+        retry = messagebox.askyesno(
+            "Fichiers échoués",
+            f"{len(failed_files)} fichiers ont échoué lors du dernier traitement.\n"
+            f"Voulez-vous réessayer de les traiter ?"
         )
-        # Traitement parallèle
-        results = pool.map(process_func, mkv_files)
-    
-    # Calculer et afficher le temps total
+        if not retry:
+            state = ProcessingState()  # Réinitialiser l'état
+    mkv_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.mkv')]
+    if not mkv_files:
+        messagebox.showwarning("Aucun fichier", "Aucun fichier MKV trouvé dans le répertoire sélectionné.")
+        return
+    first_file = next((f for f in mkv_files if not state.is_processed(f)), mkv_files[0])
+    track_info = get_mkv_tracks(os.path.join(input_dir, first_file), mkvmerge_path)
+    if not track_info:
+        messagebox.showerror("Erreur", f"Impossible d'analyser le fichier {first_file}")
+        return
+    audio_tracks = [track for track in track_info.get('tracks', []) if track['type'] == 'audio']
+    if not audio_tracks:
+        messagebox.showerror("Erreur", f"Aucune piste audio trouvée dans {first_file}")
+        return
+    # Affiche la config système au début
+    show_system_config()
+    initial_size = calculate_directory_size(input_dir)
+    while True:
+        # Sélection des pistes audio
+        selected_audio_tracks, canceled, back = choose_audio_tracks(audio_tracks, first_file)
+        if canceled:
+            return
+        if back:
+            continue  # Revenir à l'étape précédente (ici, il n'y en a pas, donc recommence)
+        # Sélection multiple des sous-titres directement
+        all_subtitles = [track for track in track_info.get('tracks', []) if track['type'] == 'subtitles']
+        if not all_subtitles:
+            selected_subtitles = []
+        else:
+            selected_subtitles, canceled, back = choose_subtitles(all_subtitles, first_file, None)
+            if canceled:
+                return
+            if back:
+                continue  # Revenir à la sélection audio
+        break  # Sortir de la boucle principale
+    os.makedirs(output_dir, exist_ok=True)
+    num_processes = calculate_optimal_processes()  # Toujours mode défaut
+    logging.info(f"Utilisation de {num_processes} processus pour le traitement (mode : défaut)")
+    start_time = time.time()
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        process_args = [
+            (mkvmerge_path, input_dir, output_dir, filename, 
+             selected_audio_tracks, None, selected_subtitles, state)
+            for filename in mkv_files if not state.is_processed(filename)
+        ]
+        results = pool.starmap(process_single_mkv, process_args)
+    failed_files = state.get_failed_files()
+    # Calcul du résumé
     end_time = time.time()
     total_time = end_time - start_time
-    
-    # Calculer la taille finale
     final_size = calculate_directory_size(output_dir)
-    
-    # Calculer l'espace économisé
     saved_size = initial_size - final_size
     saved_percentage = (saved_size / initial_size * 100) if initial_size > 0 else 0
-    
-    # Résumé des résultats
     successful = sum(results)
     failed = len(results) - successful
-
-    logging.info("\n--- Résumé du traitement ---")
-    logging.info(f"Fichiers traités : {len(results)}")
-    logging.info(f"Succès : {successful}")
-    logging.info(f"Échecs : {failed}")
-    logging.info(f"Temps total : {total_time:.2f} secondes")
-    logging.info(f"Nombre de processus utilisés : {num_processes}")
-    logging.info("\n--- Analyse de l'espace disque ---")
-    logging.info(f"Taille initiale : {format_size(initial_size)}")
-    logging.info(f"Taille finale : {format_size(final_size)}")
-    logging.info(f"Espace économisé : {format_size(saved_size)} ({saved_percentage:.2f}%)")
-    
-    # Message de fin détaillé
-    message = (
+    resume = (
         f"Traitement terminé.\n\n"
         f"Fichiers traités : {successful}/{len(results)}\n"
         f"Temps total : {total_time:.2f} secondes\n\n"
@@ -697,34 +903,48 @@ def process_mkv_files(input_dir, output_dir, mkvmerge_path):
         f"- Taille finale : {format_size(final_size)}\n"
         f"- Espace économisé : {format_size(saved_size)} ({saved_percentage:.2f}%)"
     )
-    messagebox.showinfo("Terminé", message)
+    logging.info("\n--- Résumé du traitement ---\n" + resume)
+    if failed_files:
+        error_message = "Les fichiers suivants n'ont pas pu être traités :\n\n"
+        for filename, error in failed_files.items():
+            error_message += f"{filename}: {error}\n"
+        messagebox.showerror("Erreurs de traitement", error_message + "\n" + resume)
+    else:
+        messagebox.showinfo("Succès", resume)
 
 def main():
-    # Initialiser Tkinter
+    """
+    Fonction principale du programme.
+    """
+    # Initialiser Tkinter et masquer la fenêtre principale
     root = tk.Tk()
-    root.withdraw()  # Cacher la fenêtre principale
-    # Trouver mkvmerge
-    mkvmerge_path = find_mkvmerge()
+    root.withdraw()
 
-    if not mkvmerge_path:
-        messagebox.showerror("Erreur", "Impossible de trouver mkvmerge.exe")
-        return
-    # Sélectionner le dossier d'entrée
-    input_dir = filedialog.askdirectory(
-        title="Sélectionnez le dossier contenant les fichiers MKV"
-    )
-
-    if not input_dir:
-        messagebox.showerror("Erreur", "Aucun dossier sélectionné")
-        return
-    # Définir automatiquement le dossier de sortie comme un sous-dossier 'processed'
-    output_dir = os.path.join(input_dir, 'processed')
-    # Lancer le traitement
-    process_mkv_files(input_dir, output_dir, mkvmerge_path)
-
-if __name__ == '__main__':
-    # Vérifier et installer les dépendances
+    # Vérification des dépendances
     check_and_install_dependencies()
-    # Support de l'exécution sous Windows
-    multiprocessing.freeze_support()
+    
+    # Recherche de mkvmerge
+    mkvmerge_path = find_mkvmerge()
+    if not mkvmerge_path:
+        messagebox.showerror("Erreur", "mkvmerge n'a pas été trouvé. Veuillez installer MKVToolNix.")
+        return
+    
+    # Sélection du dossier à traiter
+    input_dir = filedialog.askdirectory(title="Sélectionnez le répertoire contenant les fichiers MKV")
+    if not input_dir:
+        return
+    
+    # Traitement des fichiers
+    process_mkv_files(input_dir, os.path.join(input_dir, 'output'), mkvmerge_path)
+
+# Teste plusieurs polices Unicode pour maximiser la compatibilité des caractères spéciaux
+try:
+    UNICODE_FONT = ("Arial Unicode MS", 10)
+except:
+    try:
+        UNICODE_FONT = ("Noto Sans", 10)
+    except:
+        UNICODE_FONT = ("MS Gothic", 10)
+
+if __name__ == "__main__":
     main()
